@@ -47,4 +47,15 @@ uv run score.py
 
 The judge is model-agnostic. With `OPENAI_API_KEY` it hits OpenAI; with `OPENROUTER_API_KEY` it uses OpenRouter; set `OPENAI_BASE_URL` to point at any other OpenAI-compatible server. `MODEL` picks the judge model. Use `--limit 3` for a quick smoke test.
 
-`score.py` writes `results/scores.json` with a per-model `summary`, a `failures` list, and the full per-item `verdicts`.
+### Second judge (cross-family check)
+
+To reduce single-judge and same-family bias, set `OPENROUTER_API_KEY` and `score.py` also grades every answer with a second judge (default `anthropic/claude-sonnet-4.5`; override with `JUDGE2_MODEL`). Same prompt and schema, different model family. Without that key it runs the primary judge only.
+
+```bash
+export OPENAI_API_KEY=sk-...          # primary judge (MODEL, default gpt-4o-mini)
+export OPENROUTER_API_KEY=sk-or-...   # second judge
+export JUDGE2_MODEL=anthropic/claude-sonnet-4.5
+uv run score.py
+```
+
+`results/scores.json` has `summary` keyed by judge then answering model, an `agreement` block (verdict agreement, Cohen's kappa, list of disagreements), a `failures` list tagged with the judge, and the per-item `verdicts` (one row per judge).

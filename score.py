@@ -18,6 +18,13 @@ Environment:
   OPENROUTER_API_KEY OpenRouter key (auto-selects the OpenRouter base URL)
   OPENAI_BASE_URL    override the endpoint explicitly (any OpenAI-compatible server)
 
+Second judge (different model family, to check judge bias / self-preference):
+  OPENROUTER_API_KEY key for the second judge (always routed via OpenRouter)
+  JUDGE2_MODEL       second judge model id (default: anthropic/claude-sonnet-4.5)
+  Both judges grade every answer with the same prompt and schema; results are reported per
+  judge plus agreement (raw agreement, Cohen's kappa, disagreement list). Without an
+  OPENROUTER_API_KEY the scorer runs the primary judge only.
+
 Run:
   uv run score.py                       # judge all cached answers -> results/scores.json
   uv run score.py --limit 3             # smoke test on the first 3 answers
@@ -26,7 +33,9 @@ Run:
 import argparse
 import json
 import os
+import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 from openai import OpenAI
@@ -91,8 +100,24 @@ def make_client() -> tuple[OpenAI, str]:
     return OpenAI(api_key=key, base_url=base_url), model
 
 
+def make_judge2() -> tuple[OpenAI, str] | None:
+    """Second judge on OpenRouter, from a different family than the systems under test."""
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return None
+    model = os.environ.get("JUDGE2_MODEL", "anthropic/claude-sonnet-4.5")
+    return OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1"), model
+
+
+def parse_json(text: str) -> dict:
+    """Parse judge output; tolerate ```json fences some models add in plain-JSON mode."""
+    text = (text or "").strip()
+    m = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
+    return json.loads(m.group(1) if m else text)
+
+
 def load_jsonl(p: Path) -> list[dict]:
-    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
 def build_inputs() -> list[dict]:
@@ -132,7 +157,7 @@ def judge_one(client: OpenAI, model: str, item: dict) -> dict:
             model=model, temperature=0, messages=messages,
             response_format={"type": "json_object"},
         )
-    v = json.loads(resp.choices[0].message.content)
+    v = parse_json(resp.choices[0].message.content)
     return {k: item[k] for k in ("qid", "model", "field_key", "risk_tier", "scoring_mode")} | {
         "verdict": v.get("verdict"),
         "error_direction": v.get("error_direction", "na"),
@@ -142,10 +167,10 @@ def judge_one(client: OpenAI, model: str, item: dict) -> dict:
     }
 
 
-def aggregate(verdicts: list[dict]) -> dict:
-    models = sorted({v["model"] for v in verdicts})
+def summarize(verdicts: list[dict]) -> dict:
+    """Per-answering-model metrics for one judge's verdicts."""
     summary = {}
-    for m in models:
+    for m in sorted({v["model"] for v in verdicts}):
         rows = [v for v in verdicts if v["model"] == m]
         n = len(rows)
         correct = sum(v["verdict"] == "correct" for v in rows)
@@ -162,12 +187,61 @@ def aggregate(verdicts: list[dict]) -> dict:
             "suppressive_errors": sum(v["error_direction"] == "suppressive" for v in rows),
             "cited_official_rate": round(official / n, 3),
         }
+    return summary
+
+
+def cohens_kappa(pairs: list[tuple[str, str]]) -> float | None:
+    n = len(pairs)
+    if not n:
+        return None
+    po = sum(a == b for a, b in pairs) / n
+    ca, cb = Counter(a for a, _ in pairs), Counter(b for _, b in pairs)
+    pe = sum(ca[k] * cb[k] for k in ca.keys() | cb.keys()) / (n * n)
+    return None if pe == 1 else round((po - pe) / (1 - pe), 3)
+
+
+def agreement(verdicts: list[dict], judges: list[str]) -> dict:
+    """Compare two judges item-by-item on verdict (and suppressive flag). ERROR rows are skipped."""
+    a, b = judges
+    by = {(v["judge"], v["qid"], v["model"]): v for v in verdicts}
+    pairs, disagreements, skipped = [], [], 0
+    for (j, qid, model), va in by.items():
+        if j != a:
+            continue
+        vb = by.get((b, qid, model))
+        if not vb or "ERROR" in (va["verdict"], vb["verdict"]):
+            skipped += 1
+            continue
+        pairs.append((va["verdict"], vb["verdict"]))
+        if va["verdict"] != vb["verdict"]:
+            disagreements.append({
+                "qid": qid, "model": model, "risk_tier": va["risk_tier"],
+                a: {"verdict": va["verdict"], "error_direction": va["error_direction"], "reasoning": va["reasoning"]},
+                b: {"verdict": vb["verdict"], "error_direction": vb["error_direction"], "reasoning": vb["reasoning"]},
+            })
+    n = len(pairs)
+    return {
+        "judges": judges,
+        "compared": n,
+        "skipped_errors": skipped,
+        "verdict_agreement": round(sum(x == y for x, y in pairs) / n, 3) if n else None,
+        "cohens_kappa": cohens_kappa(pairs),
+        "disagreements": disagreements,
+    }
+
+
+def aggregate(verdicts: list[dict], judges: list[str]) -> dict:
+    summary = {j: summarize([v for v in verdicts if v["judge"] == j]) for j in judges}
     failures = [
-        {"model": v["model"], "qid": v["qid"], "risk_tier": v["risk_tier"],
+        {"judge": v["judge"], "model": v["model"], "qid": v["qid"], "risk_tier": v["risk_tier"],
          "verdict": v["verdict"], "error_direction": v["error_direction"], "reasoning": v["reasoning"]}
         for v in verdicts if v["verdict"] in ("incorrect", "ERROR")
     ]
-    return {"summary": summary, "failures": failures, "verdicts": verdicts}
+    out = {"judges": judges, "summary": summary, "failures": failures}
+    if len(judges) == 2:
+        out["agreement"] = agreement(verdicts, judges)
+    out["verdicts"] = verdicts
+    return out
 
 
 def main():
@@ -176,27 +250,40 @@ def main():
     ap.add_argument("--out", default=str(OUT))
     args = ap.parse_args()
 
-    client, model = make_client()
+    judges = [make_client()]
+    j2 = make_judge2()
+    if j2:
+        judges.append(j2)
+    else:
+        print("no OPENROUTER_API_KEY: running primary judge only (no cross-family check)", file=sys.stderr)
+    if len(judges) == 2 and judges[0][1] == judges[1][1]:
+        sys.exit(f"both judges are '{judges[0][1]}': set JUDGE2_MODEL / MODEL to different models")
+    names = [m for _, m in judges]
+
     inputs = build_inputs()
     if args.limit:
         inputs = inputs[: args.limit]
-    print(f"judge model: {model} | items: {len(inputs)}", file=sys.stderr)
+    print(f"judges: {names} | items: {len(inputs)}", file=sys.stderr)
 
     verdicts = []
     for i, item in enumerate(inputs, 1):
-        try:
-            v = judge_one(client, model, item)
-        except Exception as e:  # noqa: BLE001
-            v = {k: item[k] for k in ("qid", "model", "field_key", "risk_tier", "scoring_mode")} | {
-                "verdict": "ERROR", "error_direction": "na", "source_authority": "no_source",
-                "matches_reference": False, "reasoning": f"{type(e).__name__}: {e}"}
-        verdicts.append(v)
-        print(f"[{i}/{len(inputs)}] {v['model']} {v['qid']} -> {v['verdict']}", file=sys.stderr)
+        for client, model in judges:
+            try:
+                v = judge_one(client, model, item)
+            except Exception as e:  # noqa: BLE001
+                v = {k: item[k] for k in ("qid", "model", "field_key", "risk_tier", "scoring_mode")} | {
+                    "verdict": "ERROR", "error_direction": "na", "source_authority": "no_source",
+                    "matches_reference": False, "reasoning": f"{type(e).__name__}: {e}"}
+            v = {"judge": model} | v
+            verdicts.append(v)
+            print(f"[{i}/{len(inputs)}] {model} | {v['model']} {v['qid']} -> {v['verdict']}", file=sys.stderr)
 
-    out = aggregate(verdicts)
-    Path(args.out).write_text(json.dumps(out, ensure_ascii=False, indent=2))
+    out = aggregate(verdicts, names)
+    Path(args.out).write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nwrote {args.out}", file=sys.stderr)
-    print(json.dumps(out["summary"], indent=2))
+    print(json.dumps({"summary": out["summary"],
+                      "agreement": {k: v for k, v in out.get("agreement", {}).items() if k != "disagreements"}},
+                     indent=2))
 
 
 if __name__ == "__main__":

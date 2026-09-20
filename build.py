@@ -26,13 +26,13 @@ ANSWERS = HERE / "results" / "answers.jsonl"
 
 
 def load_jsonl(p: Path) -> list[dict]:
-    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
 
 
 def main():
     questions = load_jsonl(QUESTIONS)
     answers = load_jsonl(ANSWERS)
-    with GROUND_TRUTH.open() as fh:
+    with GROUND_TRUTH.open(encoding="utf-8", newline="") as fh:
         gt = list(csv.DictReader(fh))
 
     qids = {q["qid"] for q in questions}
